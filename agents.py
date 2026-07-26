@@ -1,57 +1,120 @@
+from dotenv import load_dotenv
+import os
+
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from tools import web_search , scrape_url 
-from dotenv import load_dotenv
 
+from tools import web_search, scrape_url
+
+# Load environment variables
 load_dotenv()
 
-llm = ChatOpenAI(model = "gpt-4o-mini" , temperature = 0)
+# Initialize the LLM
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
+# -----------------------------
+# Search Agent
+# -----------------------------
 def build_search_agent():
     return create_agent(
-        model = llm ,
-        tools = [web_search]
+        model=llm,
+        tools=[web_search],
     )
 
+
+# -----------------------------
+# Reader Agent
+# -----------------------------
 def build_reader_agent():
     return create_agent(
-        model = llm ,
-        tools = [scrape_url]
+        model=llm,
+        tools=[scrape_url],
     )
 
-writer_prompt = ChatPromptTemplate.from_template([
-    ("system" , "You are an expert reseaech writer . Write lear , structured and insigntful reports.")
-    ("human" , """Write a detailed research report on the topic below.
-    
-    Topic : {topic}
 
-    Research Report :{research}
+# -----------------------------
+# Writer Prompt
+# -----------------------------
+writer_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are an expert research writer. Write clear, well-structured, detailed, and insightful research reports using the provided information only.",
+        ),
+        (
+            "human",
+            """
+Write a detailed research report on the following topic.
 
-    Structure the report as:
-    - Introduction
-    - Key Findings (minimum 3 well-explained points)
-    - Conclusion
-    - Sources (list all URLs found in the research)
+Topic:
+{topic}
 
-    Be detailed , factual and insightful in your writing. Avoid generic statements and provide specific information based on the research provided.
-        """),
-])
+Research Material:
+{research}
+
+Structure the report as follows:
+
+1. Introduction
+2. Key Findings (at least 3 well-explained points)
+3. Conclusion
+4. Sources (list every URL mentioned in the research)
+
+Guidelines:
+- Be factual and accurate.
+- Avoid generic statements.
+- Explain each finding clearly.
+- Use headings and proper formatting.
+- Do not invent information that is not present in the research.
+""",
+        ),
+    ]
+)
+
 writer_chain = writer_prompt | llm | StrOutputParser()
 
 
-critic_prompt =  ChatPromptTemplate.from_template([
-    ("system", "You are a sharp and constructive research critic. Be honest and specific."),
-    ("human", """Review the research report below and evaluate it strictly.
-    
-    Report : {report}
+# -----------------------------
+# Critic Prompt
+# -----------------------------
+critic_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a strict and constructive research reviewer. Carefully evaluate the quality, clarity, factual accuracy, structure, and completeness of the report.",
+        ),
+        (
+            "human",
+            """
+Review the following research report.
 
-    Respond in this exact format:
-    Score : X/10
-    Strengths : (list at least 3 specific strengths of the report)
-    Area of improvement : (list at least 3 specific weaknesses of the report) 
-    One line Verdict : (Provide a concise one-line summary of your overall assessment of the report)
-    """),
-])
+Report:
+{report}
+
+Respond in exactly this format:
+
+Score: X/10
+
+Strengths:
+- Point 1
+- Point 2
+- Point 3
+
+Areas for Improvement:
+- Point 1
+- Point 2
+- Point 3
+
+One-line Verdict:
+Provide one concise sentence summarizing your overall assessment.
+""",
+        ),
+    ]
+)
+
 critic_chain = critic_prompt | llm | StrOutputParser()
