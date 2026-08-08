@@ -1,6 +1,9 @@
-import streamlit as st
 import time
-from agents import build_reader_agent, build_search_agent, writer_chain, critic_chain
+
+import streamlit as st
+
+from config import ConfigError, get_settings
+from pipeline import PipelineError, run_research_pipeline
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -9,6 +12,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ── Fail fast with a friendly message if API keys are missing ────────────────
+try:
+    get_settings()
+except ConfigError as e:
+    st.error(f"⚠️ Configuration error: {e}")
+    st.stop()
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -154,6 +164,10 @@ html, body, [class*="css"] {
     border-color: rgba(80,200,120,0.3);
     background: rgba(80,200,120,0.03);
 }
+.step-card.error {
+    border-color: rgba(255,80,80,0.4);
+    background: rgba(255,80,80,0.04);
+}
 .step-card::before {
     content: '';
     position: absolute;
@@ -165,6 +179,7 @@ html, body, [class*="css"] {
 }
 .step-card.active::before { background: #ff8c32; }
 .step-card.done::before   { background: #50c878; }
+.step-card.error::before  { background: #ff5050; }
 
 .step-header {
     display: flex;
@@ -195,6 +210,7 @@ html, body, [class*="css"] {
 .status-waiting  { color: #555; }
 .status-running  { color: #ff8c32; }
 .status-done     { color: #50c878; }
+.status-error    { color: #ff5050; }
 
 /* ── Result panels ── */
 .result-panel {
@@ -290,31 +306,47 @@ details summary {
 """, unsafe_allow_html=True)
 
 
-# ── Helper: render a step card ────────────────────────────────────────────────
-def step_card(num: str, title: str, state: str, desc: str = ""):
-    status_map = {
-        "waiting": ("WAITING", "status-waiting"),
-        "running": ("● RUNNING", "status-running"),
-        "done":    ("✓ DONE",   "status-done"),
-    }
-    label, cls = status_map.get(state, ("", ""))
-    card_cls = {"running": "active", "done": "done"}.get(state, "")
-    st.markdown(f"""
-    <div class="step-card {card_cls}">
-        <div class="step-header">
-            <span class="step-num">{num}</span>
-            <span class="step-title">{title}</span>
-            <span class="step-status {cls}">{label}</span>
+STEP_META = {
+    "search": ("01", "Search Agent", "Gathers recent web information"),
+    "reader": ("02", "Reader Agent", "Scrapes & extracts deep content"),
+    "writer": ("03", "Writer Chain", "Drafts the full research report"),
+    "critic": ("04", "Critic Chain", "Reviews & scores the report"),
+}
+STATUS_LABEL = {
+    "waiting": "WAITING",
+    "running": "● RUNNING",
+    "done": "✓ DONE",
+    "error": "✕ ERROR",
+}
+STATUS_CARD_CLASS = {
+    "waiting": "",
+    "running": "active",
+    "done": "done",
+    "error": "error",
+}
+
+
+def render_step_card(placeholder, key: str, status: str) -> None:
+    num, title, desc = STEP_META[key]
+    placeholder.markdown(
+        f"""
+        <div class="step-card {STATUS_CARD_CLASS[status]}">
+            <div class="step-header">
+                <span class="step-num">{num}</span>
+                <span class="step-title">{title}</span>
+                <span class="step-status status-{status}">{STATUS_LABEL[status]}</span>
+            </div>
+            <div style='font-size:0.82rem;color:#706860;margin-top:0.3rem;'>{desc}</div>
         </div>
-        {"<div style='font-size:0.82rem;color:#706860;margin-top:0.3rem;'>"+desc+"</div>" if desc else ""}
-    </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ── Session state init ────────────────────────────────────────────────────────
-for key in ("results", "running", "done"):
+for key, default in (("results", {}), ("errors", []), ("pipeline_error", None)):
     if key not in st.session_state:
-        st.session_state[key] = {} if key == "results" else False
+        st.session_state[key] = default
 
 
 # ── Hero ──────────────────────────────────────────────────────────────────────
@@ -345,7 +377,6 @@ with col_input:
     run_btn = st.button("⚡  Run Research Pipeline", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Example chips
     st.markdown("""
     <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
         <span style="font-family:'DM Mono',monospace;font-size:0.68rem;color:#605850;letter-spacing:0.1em;">TRY →</span>
@@ -368,30 +399,9 @@ with col_input:
 
 with col_pipeline:
     st.markdown('<div class="section-heading">Pipeline</div>', unsafe_allow_html=True)
-
-    r = st.session_state.results
-    done = st.session_state.done
-
-    def s(step):
-        if not r:
-            return "waiting"
-        steps = ["search", "reader", "writer", "critic"]
-        idx = steps.index(step)
-        completed = list(r.keys())
-        # figure out which steps are done
-        if step in r:
-            return "done"
-        # which step is running now (first not in r)
-        if st.session_state.running:
-            for i, k in enumerate(steps):
-                if k not in r:
-                    return "running" if k == step else "waiting"
-        return "waiting"
-
-    step_card("01", "Search Agent",  s("search"), "Gathers recent web information")
-    step_card("02", "Reader Agent",  s("reader"), "Scrapes & extracts deep content")
-    step_card("03", "Writer Chain",  s("writer"), "Drafts the full research report")
-    step_card("04", "Critic Chain",  s("critic"), "Reviews & scores the report")
+    step_placeholders = {key: st.empty() for key in STEP_META}
+    for key in STEP_META:
+        render_step_card(step_placeholders[key], key, "waiting")
 
 
 # ── Run pipeline ──────────────────────────────────────────────────────────────
@@ -400,59 +410,37 @@ if run_btn:
         st.warning("Please enter a research topic first.")
     else:
         st.session_state.results = {}
-        st.session_state.running = True
-        st.session_state.done = False
-        st.rerun()
+        st.session_state.errors = []
+        st.session_state.pipeline_error = None
 
-if st.session_state.running and not st.session_state.done:
-    results = {}
-    topic_val = st.session_state.topic_input
+        def on_progress(step: str, status: str) -> None:
+            # Updates the placeholder in place — Streamlit streams this to the
+            # browser as it happens, so the pipeline card genuinely reflects
+            # live progress instead of only refreshing after everything finishes.
+            render_step_card(step_placeholders[step], step, status)
 
-    # ── Step 1: Search ──
-    with st.spinner("🔍  Search Agent is working…"):
-        search_agent = build_search_agent()
-        sr = search_agent.invoke({
-            "messages": [("user", f"Find recent, reliable and detailed information about: {topic_val}")]
-        })
-        results["search"] = sr["messages"][-1].content
-        st.session_state.results = dict(results)
-    st.rerun() if False else None   # keep inline for now
+        try:
+            state = run_research_pipeline(topic, progress_callback=on_progress)
+        except PipelineError as e:
+            st.session_state.pipeline_error = str(e)
+        else:
+            st.session_state.results = {
+                "search": state.search_results,
+                "reader": state.scraped_content,
+                "writer": state.report,
+                "critic": state.feedback,
+            }
+            st.session_state.errors = state.errors
 
-    # ── Step 2: Reader ──
-    with st.spinner("📄  Reader Agent is scraping top resources…"):
-        reader_agent = build_reader_agent()
-        rr = reader_agent.invoke({
-            "messages": [("user",
-                f"Based on the following search results about '{topic_val}', "
-                f"pick the most relevant URL and scrape it for deeper content.\n\n"
-                f"Search Results:\n{results['search'][:800]}"
-            )]
-        })
-        results["reader"] = rr["messages"][-1].content
-        st.session_state.results = dict(results)
 
-    # ── Step 3: Writer ──
-    with st.spinner("✍️  Writer is drafting the report…"):
-        research_combined = (
-            f"SEARCH RESULTS:\n{results['search']}\n\n"
-            f"DETAILED SCRAPED CONTENT:\n{results['reader']}"
-        )
-        results["writer"] = writer_chain.invoke({
-            "topic": topic_val,
-            "research": research_combined
-        })
-        st.session_state.results = dict(results)
+# ── Error banner ──────────────────────────────────────────────────────────────
+if st.session_state.pipeline_error:
+    st.error(f"⚠️ The pipeline could not complete: {st.session_state.pipeline_error}")
 
-    # ── Step 4: Critic ──
-    with st.spinner("🧐  Critic is reviewing the report…"):
-        results["critic"] = critic_chain.invoke({
-            "report": results["writer"]
-        })
-        st.session_state.results = dict(results)
-
-    st.session_state.running = False
-    st.session_state.done = True
-    st.rerun()
+if st.session_state.errors:
+    with st.expander("⚠️ Non-fatal warnings during this run", expanded=False):
+        for err in st.session_state.errors:
+            st.markdown(f"- {err}")
 
 
 # ── Results display ───────────────────────────────────────────────────────────
@@ -462,27 +450,30 @@ if r:
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="section-heading">Results</div>', unsafe_allow_html=True)
 
-    # Raw outputs in expanders
     if "search" in r:
         with st.expander("🔍 Search Results (raw)", expanded=False):
-            st.markdown(f'<div class="result-panel"><div class="result-panel-title">Search Agent Output</div>'
-                        f'<div class="result-content">{r["search"]}</div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="result-panel"><div class="result-panel-title">Search Agent Output</div>'
+                f'<div class="result-content">{r["search"]}</div></div>',
+                unsafe_allow_html=True,
+            )
 
     if "reader" in r:
         with st.expander("📄 Scraped Content (raw)", expanded=False):
-            st.markdown(f'<div class="result-panel"><div class="result-panel-title">Reader Agent Output</div>'
-                        f'<div class="result-content">{r["reader"]}</div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="result-panel"><div class="result-panel-title">Reader Agent Output</div>'
+                f'<div class="result-content">{r["reader"]}</div></div>',
+                unsafe_allow_html=True,
+            )
 
-    # Final report
     if "writer" in r:
         st.markdown("""
         <div class="report-panel">
             <div class="panel-label orange">📝 Final Research Report</div>
         """, unsafe_allow_html=True)
-        st.markdown(r["writer"])   # render markdown natively
+        st.markdown(r["writer"])
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Download
         st.download_button(
             label="⬇  Download Report (.md)",
             data=r["writer"],
@@ -490,7 +481,6 @@ if r:
             mime="text/markdown",
         )
 
-    # Critic feedback
     if "critic" in r:
         st.markdown("""
         <div class="feedback-panel">
